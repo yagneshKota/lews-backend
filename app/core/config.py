@@ -9,7 +9,7 @@ RiskTier = Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(".env", "env"),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     database_url: str = Field(
         default="postgresql+psycopg://landguard:landguard@localhost:5432/landguard"
     )
+    auto_create_tables: bool = Field(default=True)
     ml_model_path: str = "./ml_artifacts/landslide_xgboost_model.pkl"
     ml_preprocessor_path: str = "./ml_artifacts/preprocessor.pkl"
     ml_model_version: str = "lgbm-phase3-v1"

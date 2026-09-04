@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models.report import Report
@@ -55,3 +55,6 @@ class ReportRepository:
                 .limit(limit)
             )
         )
+
+    def count(self) -> int:
+        return self.db.scalar(select(func.count()).select_from(Report)) or 0

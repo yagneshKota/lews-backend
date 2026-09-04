@@ -66,7 +66,7 @@ REPORT_BODY = {
 }
 
 
-def fake_critical_result(**_kwargs) -> PredictionResult:
+def fake_critical_result(*_args, **_kwargs) -> PredictionResult:
     return PredictionResult(
         risk_score=0.91,
         risk_level=3,

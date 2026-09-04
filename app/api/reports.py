@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.repositories.report_repository import ReportRepository
-from app.schemas.report import ReportCreate, ReportResponse
+from app.schemas.report import PaginatedReportsResponse, ReportCreate, ReportResponse
 from app.services.report_service import ReportService
 
 
@@ -41,7 +41,7 @@ def create_report(
     return ReportService(db).create(payload)
 
 
-@router.get("", response_model=list[ReportResponse])
+@router.get("", response_model=PaginatedReportsResponse)
 def get_reports(
     offset: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=500),

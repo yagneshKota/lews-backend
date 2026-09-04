@@ -1,0 +1,9 @@
+DATABASE_URL=postgresql+psycopg://postgres:1234567890@localhost:5432/landguard
+AUTO_CREATE_TABLES=true
+ML_MODEL_PATH=./ml_artifacts/landslide_xgboost_model.pkl
+ML_PREPROCESSOR_PATH=./ml_artifacts/preprocessor.pkl
+ML_MODEL_VERSION=lgbm-phase3-v1
+ENVIRONMENT=development
+CORS_ORIGINS=http://localhost:3000,http://localhost:5173,https://landguard-eight.vercel.app
+ALERT_MIN_TIER=CRITICAL
+LOG_LEVEL=INFO
