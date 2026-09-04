@@ -1,4 +1,4 @@
-DATABASE_URL=postgresql+psycopg://postgres:1234567890@localhost:5432/landguard
+DATABASE_URL=postgresql://neondb_owner:npg_6KAQplPo7UqB@ep-restless-recipe-aejxro1x-pooler.c-2.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require
 AUTO_CREATE_TABLES=true
 ML_MODEL_PATH=./ml_artifacts/landslide_xgboost_model.pkl
 ML_PREPROCESSOR_PATH=./ml_artifacts/preprocessor.pkl
