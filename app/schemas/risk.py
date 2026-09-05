@@ -73,3 +73,19 @@ class RiskResult(BaseModel):
     risk_tier: str
     alert_triggered: bool
     alert_message: str
+
+
+class LiveRiskRequest(BaseModel):
+    latitude: float = Field(..., ge=-90.0, le=90.0, description="WGS84 GPS Latitude")
+    longitude: float = Field(..., ge=-180.0, le=180.0, description="WGS84 GPS Longitude")
+
+
+class LiveRiskResponse(BaseModel):
+    location: dict[str, Any]
+    features: dict[str, float | int]
+    prediction: dict[str, Any]
+    environmental: dict[str, Any]
+    data_sources: dict[str, str]
+    data_timestamp: str
+    data_age_seconds: int = 0
+    data_status: str

@@ -705,21 +705,24 @@ def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> fl
 
 def evaluate_location_ml(loc: dict[str, Any]) -> dict[str, Any]:
     """Runs backend ML model on location's geotechnical parameters."""
+    r1d = float(loc.get("rainfall_24h", 20.0))
+    r3d = float(loc.get("rainfall_3d", 55.0))
+    r7d = float(loc.get("rainfall_7d", 110.0))
+    ratio = round(r3d / max(1.0, r7d), 3) if r7d > 0 else 0.0
+
     feat = {
-        "elevation_m": float(loc["elevation_m"]),
-        "slope_degrees": float(loc["slope_degrees"]),
-        "aspect_degrees": float(loc["aspect_degrees"]),
-        "rainfall_1d_before": float(loc["rainfall_24h"]),
-        "rainfall_3d_before": float(loc["rainfall_3d"]),
-        "rainfall_7d_before": float(loc["rainfall_7d"]),
-        "rainfall_14d_before": float(loc["rainfall_7d"] * 1.4),
-        "rainfall_30d_before": float(loc["rainfall_7d"] * 2.1),
-        "rainfall_7d_max1d": float(loc["rainfall_24h"]),
-        "rainfall_3d_over_7d_ratio": round(
-            float(loc["rainfall_3d"]) / max(1.0, float(loc["rainfall_7d"])), 3
-        ),
-        "soil_moisture": float(loc["soil_moisture"]),
-        "soil_moisture_available": 1,
+        "elevation_m": float(loc.get("elevation_m", 1200.0)),
+        "slope_degrees": float(loc.get("slope_degrees", 25.0)),
+        "aspect_degrees": float(loc.get("aspect_degrees", 135.0)),
+        "rainfall_1d_before": r1d,
+        "rainfall_3d_before": r3d,
+        "rainfall_7d_before": r7d,
+        "rainfall_14d_before": float(loc.get("rainfall_14d_before", r7d)),
+        "rainfall_30d_before": float(loc.get("rainfall_30d_before", r7d * 1.5)),
+        "rainfall_7d_max1d": float(loc.get("rainfall_7d_max1d", r1d)),
+        "rainfall_3d_over_7d_ratio": ratio,
+        "soil_moisture": float(loc.get("soil_moisture", 0.525)),
+        "soil_moisture_available": int(loc.get("soil_moisture_available", 1)),
     }
     try:
         prepared = FeatureService.prepare(feat)
@@ -733,14 +736,13 @@ def evaluate_location_ml(loc: dict[str, Any]) -> dict[str, Any]:
             "alertMessage": result.alert_message,
         }
     except Exception:
-        # Fallback estimation if model weights not loaded
         raw = min(
             0.98,
             max(
                 0.15,
-                (loc["rainfall_24h"] * 1.5 + loc["rainfall_3d"] * 0.5) / 220
-                + (loc["slope_degrees"] / 60) * 0.35
-                + loc["soil_moisture"] * 0.25,
+                (r1d * 1.5 + r3d * 0.5) / 220
+                + (float(loc.get("slope_degrees", 25)) / 60) * 0.35
+                + float(loc.get("soil_moisture", 0.52)) * 0.25,
             ),
         )
         tier = "CRITICAL" if raw >= 0.85 else "HIGH" if raw >= 0.60 else "MEDIUM" if raw >= 0.30 else "LOW"
@@ -812,6 +814,8 @@ def get_location_by_id(location_id: str) -> dict[str, Any]:
 @router.get("/{location_id}/dashboard")
 async def get_location_dashboard(location_id: str) -> dict[str, Any]:
     """Generates complete dynamic LEWS dashboard telemetry for this location using real-time Open-Meteo & Open GIS APIs and ML Risk Inference."""
+    from app.services.live_feature_service import LiveFeatureService
+
     loc = None
     for item in NORTHEAST_LOCATIONS_DB:
         if item["id"].lower() == location_id.lower():
@@ -821,27 +825,13 @@ async def get_location_dashboard(location_id: str) -> dict[str, Any]:
         loc = NORTHEAST_LOCATIONS_DB[0]
 
     lat, lng = loc["coordinates"]
-    realtime = await WeatherGisService.get_realtime_telemetry(
-        latitude=lat,
-        longitude=lng,
-        fallback_elevation=float(loc["elevation_m"]),
-        fallback_slope=float(loc["slope_degrees"]),
-    )
+    live_risk = await LiveFeatureService.get_live_risk_for_coordinate(latitude=lat, longitude=lng)
+    realtime_env = live_risk.get("environmental", {})
+    live_features = live_risk.get("features", {})
+    prediction = live_risk.get("prediction", {})
 
-    # Blend real-time meteorological & GIS telemetry with location baseline
-    live_loc = {
-        **loc,
-        "elevation_m": realtime.get("elevation_m", loc["elevation_m"]),
-        "slope_degrees": realtime.get("slope_degrees", loc["slope_degrees"]),
-        "rainfall_24h": realtime.get("rainfall_24h", loc["rainfall_24h"]),
-        "rainfall_3d": realtime.get("rainfall_3d", loc["rainfall_3d"]),
-        "rainfall_7d": realtime.get("rainfall_7d", loc["rainfall_7d"]),
-        "soil_moisture": realtime.get("soil_moisture", loc["soil_moisture"]),
-    }
-
-    evaluated = evaluate_location_ml(live_loc)
-    risk_score = evaluated["riskScore"]
-    risk_tier = evaluated["riskTier"]
+    risk_score = int(round(prediction.get("risk_score", 0.5) * 100))
+    risk_tier = prediction.get("risk_tier", "MEDIUM")
 
     mapped_level = (
         "CRITICAL"
@@ -852,6 +842,21 @@ async def get_location_dashboard(location_id: str) -> dict[str, Any]:
         if risk_tier == "MEDIUM"
         else "SAFE"
     )
+
+    live_rainfall24h = realtime_env.get("rainfall_24h", loc.get("rainfall_24h", 35.0))
+    live_soil_moisture = realtime_env.get("soil_moisture", 0.52)
+    live_elevation = live_features.get("elevation_m", loc.get("elevation_m", 1200))
+    live_slope = live_features.get("slope_degrees", loc.get("slope_degrees", 25))
+
+    live_loc = {
+        **loc,
+        "elevation_m": live_elevation,
+        "slope_degrees": live_slope,
+        "rainfall_24h": live_rainfall24h,
+        "rainfall_3d": realtime_env.get("rainfall_3d", 55.0),
+        "rainfall_7d": realtime_env.get("rainfall_7d", 110.0),
+        "soil_moisture": live_soil_moisture,
+    }
 
     # Dynamic risk zones around location
     risk_zones = [
@@ -925,10 +930,10 @@ async def get_location_dashboard(location_id: str) -> dict[str, Any]:
         "environmental": {
             "rainfall24h": live_loc["rainfall_24h"],
             "soilMoisture": int(round(live_loc["soil_moisture"] * 100)),
-            "temperature": realtime.get("temperature", 15 if live_loc["elevation_m"] > 2000 else 23),
+            "temperature": realtime_env.get("temperature", 15 if live_loc["elevation_m"] > 2000 else 23),
             "groundMovement": 1.6 if risk_tier == "CRITICAL" else 0.4,
-            "humidity": realtime.get("humidity", 88),
-            "windSpeed": realtime.get("wind_speed", 14),
+            "humidity": realtime_env.get("humidity", 88),
+            "windSpeed": realtime_env.get("wind_speed", 14),
         },
         "telemetrySource": "Open-Meteo Real-Time Weather & Open GIS API",
         "mlSource": "Phase 3 LightGBM ML Risk Engine",
