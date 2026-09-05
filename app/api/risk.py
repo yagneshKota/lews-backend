@@ -56,6 +56,7 @@ async def get_live_risk(
             status_code=503,
             content={
                 "data_status": "UNAVAILABLE",
+                "missing_source": exc.missing_source or "external-api",
                 "prediction": None,
                 "message": f"Live environmental telemetry is currently unavailable: {exc.message}",
                 "location": {"latitude": lat, "longitude": lng},
@@ -117,6 +118,7 @@ async def post_live_risk(
             status_code=503,
             content={
                 "data_status": "UNAVAILABLE",
+                "missing_source": exc.missing_source or "external-api",
                 "prediction": None,
                 "message": f"Live environmental telemetry is currently unavailable: {exc.message}",
                 "location": {"latitude": payload.latitude, "longitude": payload.longitude},
