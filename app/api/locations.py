@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from app.ml.predictor import predictor
 from app.services.feature_service import FeatureService
+from app.services.weather_gis_service import WeatherGisService
 
 router = APIRouter(prefix="/api/locations", tags=["locations"])
 
@@ -809,8 +810,8 @@ def get_location_by_id(location_id: str) -> dict[str, Any]:
 
 
 @router.get("/{location_id}/dashboard")
-def get_location_dashboard(location_id: str) -> dict[str, Any]:
-    """Generates complete dynamic LEWS dashboard telemetry for this location."""
+async def get_location_dashboard(location_id: str) -> dict[str, Any]:
+    """Generates complete dynamic LEWS dashboard telemetry for this location using real-time Open-Meteo & Open GIS APIs and ML Risk Inference."""
     loc = None
     for item in NORTHEAST_LOCATIONS_DB:
         if item["id"].lower() == location_id.lower():
@@ -819,8 +820,26 @@ def get_location_dashboard(location_id: str) -> dict[str, Any]:
     if not loc:
         loc = NORTHEAST_LOCATIONS_DB[0]
 
-    evaluated = evaluate_location_ml(loc)
     lat, lng = loc["coordinates"]
+    realtime = await WeatherGisService.get_realtime_telemetry(
+        latitude=lat,
+        longitude=lng,
+        fallback_elevation=float(loc["elevation_m"]),
+        fallback_slope=float(loc["slope_degrees"]),
+    )
+
+    # Blend real-time meteorological & GIS telemetry with location baseline
+    live_loc = {
+        **loc,
+        "elevation_m": realtime.get("elevation_m", loc["elevation_m"]),
+        "slope_degrees": realtime.get("slope_degrees", loc["slope_degrees"]),
+        "rainfall_24h": realtime.get("rainfall_24h", loc["rainfall_24h"]),
+        "rainfall_3d": realtime.get("rainfall_3d", loc["rainfall_3d"]),
+        "rainfall_7d": realtime.get("rainfall_7d", loc["rainfall_7d"]),
+        "soil_moisture": realtime.get("soil_moisture", loc["soil_moisture"]),
+    }
+
+    evaluated = evaluate_location_ml(live_loc)
     risk_score = evaluated["riskScore"]
     risk_tier = evaluated["riskTier"]
 
@@ -842,9 +861,9 @@ def get_location_dashboard(location_id: str) -> dict[str, Any]:
             "sectorCode": f"{loc['name'][:3].upper()}-SEC-01",
             "riskScore": risk_score,
             "riskLevel": mapped_level,
-            "rainfall24h": loc["rainfall_24h"],
-            "soilMoisture": int(round(loc["soil_moisture"] * 100)),
-            "slopeAngle": loc["slope_degrees"],
+            "rainfall24h": live_loc["rainfall_24h"],
+            "soilMoisture": int(round(live_loc["soil_moisture"] * 100)),
+            "slopeAngle": live_loc["slope_degrees"],
             "historicalEvents": 7,
             "predictionWindow": "2–4 hours" if risk_tier == "CRITICAL" else "4–8 hours",
             "confidence": 92,
@@ -856,7 +875,7 @@ def get_location_dashboard(location_id: str) -> dict[str, Any]:
                 [lat - 0.003, lng - 0.008],
             ],
             "center": [lat + 0.003, lng + 0.001],
-            "elevation": loc["elevation_m"],
+            "elevation": live_loc["elevation_m"],
             "description": loc["description"],
             "sensorsCount": loc["sensors_count"],
             "populationAtRisk": loc["population_at_risk"],
@@ -868,9 +887,9 @@ def get_location_dashboard(location_id: str) -> dict[str, Any]:
             "sectorCode": f"{loc['name'][:3].upper()}-HWY-02",
             "riskScore": max(20, risk_score - 14),
             "riskLevel": "HIGH" if risk_tier == "CRITICAL" else "WATCH",
-            "rainfall24h": int(loc["rainfall_24h"] * 0.9),
-            "soilMoisture": int(round(loc["soil_moisture"] * 90)),
-            "slopeAngle": max(18, loc["slope_degrees"] - 5),
+            "rainfall24h": int(live_loc["rainfall_24h"] * 0.9),
+            "soilMoisture": int(round(live_loc["soil_moisture"] * 90)),
+            "slopeAngle": max(18, live_loc["slope_degrees"] - 5),
             "historicalEvents": 4,
             "predictionWindow": "6–12 hours",
             "confidence": 88,
@@ -881,7 +900,7 @@ def get_location_dashboard(location_id: str) -> dict[str, Any]:
                 [lat - 0.021, lng - 0.001],
             ],
             "center": [lat - 0.013, lng + 0.001],
-            "elevation": int(loc["elevation_m"] * 0.94),
+            "elevation": int(live_loc["elevation_m"] * 0.94),
             "description": "Arterial road cut slope with rockfall protection wire and inclinometer sensors.",
             "sensorsCount": 4,
             "populationAtRisk": int(loc["population_at_risk"] * 0.55),
@@ -904,39 +923,41 @@ def get_location_dashboard(location_id: str) -> dict[str, Any]:
         "highRiskZonesCount": len(risk_zones),
         "blockedRoadsCount": 1 if risk_tier == "CRITICAL" else 0,
         "environmental": {
-            "rainfall24h": loc["rainfall_24h"],
-            "soilMoisture": int(round(loc["soil_moisture"] * 100)),
-            "temperature": 15 if loc["elevation_m"] > 2000 else 23,
+            "rainfall24h": live_loc["rainfall_24h"],
+            "soilMoisture": int(round(live_loc["soil_moisture"] * 100)),
+            "temperature": realtime.get("temperature", 15 if live_loc["elevation_m"] > 2000 else 23),
             "groundMovement": 1.6 if risk_tier == "CRITICAL" else 0.4,
-            "humidity": 88,
-            "windSpeed": 14,
+            "humidity": realtime.get("humidity", 88),
+            "windSpeed": realtime.get("wind_speed", 14),
         },
+        "telemetrySource": "Open-Meteo Real-Time Weather & Open GIS API",
+        "mlSource": "Phase 3 LightGBM ML Risk Engine",
         "explainability": [
             {
                 "factor": "Antecedent Precipitation",
                 "percentage": 36,
-                "metricValue": f"{loc['rainfall_24h']} mm / 24h",
+                "metricValue": f"{live_loc['rainfall_24h']} mm / 24h",
                 "category": "rainfall",
-                "impact": "high" if loc["rainfall_24h"] > 60 else "moderate",
+                "impact": "high" if live_loc["rainfall_24h"] > 60 else "moderate",
             },
             {
                 "factor": "Soil Saturation Ratio",
                 "percentage": 28,
-                "metricValue": f"{int(round(loc['soil_moisture'] * 100))}% saturation",
+                "metricValue": f"{int(round(live_loc['soil_moisture'] * 100))}% saturation",
                 "category": "soil",
-                "impact": "high" if loc["soil_moisture"] > 0.7 else "moderate",
+                "impact": "high" if live_loc["soil_moisture"] > 0.7 else "moderate",
             },
             {
                 "factor": "Slope Incline",
                 "percentage": 22,
-                "metricValue": f"{loc['slope_degrees']}° critical grade",
+                "metricValue": f"{live_loc['slope_degrees']}° critical grade",
                 "category": "slope",
-                "impact": "high" if loc["slope_degrees"] > 35 else "moderate",
+                "impact": "high" if live_loc["slope_degrees"] > 35 else "moderate",
             },
             {
                 "factor": "Altitude & Orography",
                 "percentage": 14,
-                "metricValue": f"{loc['elevation_m']} m above MSL",
+                "metricValue": f"{live_loc['elevation_m']} m above MSL",
                 "category": "movement",
                 "impact": "moderate",
             },

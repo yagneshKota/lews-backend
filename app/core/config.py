@@ -37,6 +37,19 @@ class Settings(BaseSettings):
     def cors_origin_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
 
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def normalize_database_url(cls, value: str) -> str:
+        if not value:
+            return value
+        v = str(value).strip()
+        # If postgresql:// is used, normalize to postgresql+psycopg:// for SQLAlchemy 2 + psycopg 3
+        if v.startswith("postgresql://"):
+            v = "postgresql+psycopg://" + v[len("postgresql://"):]
+        elif v.startswith("postgres://"):
+            v = "postgresql+psycopg://" + v[len("postgres://"):]
+        return v
+
     @property
     def is_sqlite(self) -> bool:
         return self.database_url.startswith("sqlite")

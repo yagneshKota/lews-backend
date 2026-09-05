@@ -5,8 +5,18 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.models.report import Report
 from app.models.risk_prediction import RiskPrediction
+from app.services.weather_gis_service import WeatherGisService
 
 router = APIRouter(prefix="/api/gis", tags=["gis"])
+
+
+@router.get("/live-telemetry")
+async def get_live_telemetry(
+    lat: float = Query(..., ge=-90, le=90),
+    lng: float = Query(..., ge=-180, le=180),
+):
+    """Fetches real-time Open-Meteo precipitation, soil moisture, and GIS elevation for any GPS coordinate."""
+    return await WeatherGisService.get_realtime_telemetry(lat, lng)
 
 
 @router.get("/reports")

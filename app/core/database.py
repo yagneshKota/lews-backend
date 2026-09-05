@@ -22,7 +22,7 @@ if settings.is_sqlite:
     if settings.database_url.endswith(":memory:"):
         engine_kwargs["poolclass"] = StaticPool
 else:
-    connect_args = {"connect_timeout": 3}
+    connect_args = {"connect_timeout": 10}
 
 try:
     engine = create_engine(
@@ -32,7 +32,7 @@ try:
     )
     # Test connection
     with engine.connect() as conn:
-        pass
+        logger.info("Successfully connected to database at %s", settings.database_url.split('@')[-1] if '@' in settings.database_url else settings.database_url)
 except Exception as exc:
     logger.warning(
         "Could not connect to PostgreSQL at %s (%s). Falling back to local SQLite database: sqlite:///./landguard.db",
