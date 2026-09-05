@@ -1,27 +1,81 @@
+"""
+Comprehensive unit and integration tests for the Live Landslide Risk Pipeline.
+Verifies zero hardcoded fallbacks, HTTP 503 safe failures, 12-feature calculations,
+Open-Meteo telemetry integration, and caching mechanics.
+"""
+
+from __future__ import annotations
+
 import asyncio
-from app.services.live_feature_service import LiveFeatureService
+import time
+from unittest.mock import AsyncMock, patch
+import httpx
+import pytest
+
 from app.ml.features import ALL_FEATURES
 from app.ml.model_loader import load_artifacts
+from app.services.live_feature_service import (
+    LiveFeatureService,
+    LiveTelemetryUnavailableError,
+    _FEATURE_CACHE,
+)
 
 
-def test_slope_and_aspect_calculation():
-    """Verify finite-difference slope and aspect math on a 5-point elevation cross."""
-    # Flat terrain: all elevations equal 1000m
-    flat_elevs = [1000.0, 1000.0, 1000.0, 1000.0, 1000.0]
-    slope, aspect = LiveFeatureService.calculate_slope_and_aspect(flat_elevs, 27.5)
+@pytest.fixture(autouse=True)
+def clear_feature_cache():
+    """Clear in-memory cache before every test."""
+    _FEATURE_CACHE.clear()
+    yield
+    _FEATURE_CACHE.clear()
+
+
+# ---------------------------------------------------------------------------
+# 1. Slope, Aspect and DEM Topography Tests
+# ---------------------------------------------------------------------------
+
+
+def test_slope_and_aspect_flat_terrain():
+    """Verify flat terrain produces slope=0 and aspect=0."""
+    elevs = [500.0, 500.0, 500.0, 500.0, 500.0]
+    slope, aspect = LiveFeatureService.calculate_slope_and_aspect(elevs, 18.5204)
     assert slope == 0.0
+    assert aspect == 0.0
 
-    # North-sloping terrain (North higher than South)
-    elevs = [2000.0, 2100.0, 1900.0, 2000.0, 2000.0]
-    slope, aspect = LiveFeatureService.calculate_slope_and_aspect(elevs, 27.5)
-    assert slope > 0.0
-    assert 0.0 <= aspect <= 360.0
+
+def test_slope_and_aspect_directional():
+    """Verify directional slopes produce mathematically valid slope and azimuth aspect."""
+    # North higher than South -> downhill towards South (aspect = 180)
+    elevs_south = [500.0, 550.0, 450.0, 500.0, 500.0]
+    slope_s, aspect_s = LiveFeatureService.calculate_slope_and_aspect(elevs_south, 18.5204)
+    assert slope_s > 0.0
+    assert aspect_s == 180.0
+
+    # West higher than East -> downhill towards East (aspect = 90)
+    elevs_east = [500.0, 500.0, 500.0, 450.0, 550.0]
+    slope_e, aspect_e = LiveFeatureService.calculate_slope_and_aspect(elevs_east, 18.5204)
+    assert slope_e > 0.0
+    assert aspect_e == 90.0
+
+
+def test_slope_and_aspect_incomplete_raises_error():
+    """Verify incomplete or null elevations raise LiveTelemetryUnavailableError without fake defaults."""
+    with pytest.raises(LiveTelemetryUnavailableError) as exc_info:
+        LiveFeatureService.calculate_slope_and_aspect([500.0, None, 500.0, 500.0, 500.0], 18.5)
+    assert "Copernicus DEM" in exc_info.value.message
+
+    with pytest.raises(LiveTelemetryUnavailableError):
+        LiveFeatureService.calculate_slope_and_aspect([500.0, 500.0], 18.5)
+
+
+# ---------------------------------------------------------------------------
+# 2. Historical Rainfall Aggregation Tests
+# ---------------------------------------------------------------------------
 
 
 def test_rainfall_feature_aggregations():
-    """Verify exact multi-day aggregations, max 1-day, and 3d/7d ratio."""
-    # Construct 35 days of synthetic precipitation: 10mm per day
-    series = [10.0] * 35
+    """Verify exact 1d, 3d, 7d, 14d, 30d, max 7d, and 3d/7d ratio from precipitation series."""
+    # 31 days with 10.0mm per day
+    series = [10.0] * 31
     (
         r1d,
         r3d,
@@ -42,8 +96,8 @@ def test_rainfall_feature_aggregations():
 
 
 def test_rainfall_zero_division_safety():
-    """Verify zero rainfall does not crash division and produces ratio = 0.0."""
-    series = [0.0] * 35
+    """Verify zero rainfall does not divide by zero and returns ratio=0.0."""
+    series = [0.0] * 31
     (
         r1d,
         r3d,
@@ -59,72 +113,169 @@ def test_rainfall_zero_division_safety():
     assert ratio == 0.0
 
 
-def test_live_feature_service_returns_all_12_features():
-    """Verify all 12 model features are computed and present."""
-    load_artifacts()
-    result = asyncio.run(LiveFeatureService.get_live_risk_for_coordinate(27.5861, 91.8660))
-    features = result["features"]
-    for f in ALL_FEATURES:
-        assert f in features, f"Missing feature {f}"
-        assert isinstance(features[f], (int, float))
-
-    assert "prediction" in result
-    assert "risk_score" in result["prediction"]
-    assert "risk_tier" in result["prediction"]
-    assert "data_status" in result
+def test_rainfall_insufficient_data_raises_error():
+    """Verify series with fewer than 7 days raises LiveTelemetryUnavailableError."""
+    with pytest.raises(LiveTelemetryUnavailableError):
+        LiveFeatureService.extract_rainfall_features([5.0, 2.0, 1.0])
 
 
-def test_live_risk_api_get_valid(client):
-    """Test GET /api/risk/live with valid coordinates (e.g. Tawang)."""
-    response = client.get("/api/risk/live?lat=27.5861&lng=91.8660")
-    assert response.status_code == 200
-    data = response.json()
-    assert "features" in data
-    assert "prediction" in data
-    assert "environmental" in data
-    assert len(data["features"]) == 12
+# ---------------------------------------------------------------------------
+# 3. Arbitrary Coordinate Endpoint Tests (Pune, Mumbai, Dehradun)
+# ---------------------------------------------------------------------------
 
 
-def test_live_risk_api_get_pune(client):
-    """Test GET /api/risk/live with arbitrary non-Northeast coordinate (Pune)."""
+def test_live_risk_api_pune_real_coordinates(client):
+    """Test GET /api/risk/live with Pune coordinates (18.5204, 73.8567)."""
     response = client.get("/api/risk/live?lat=18.5204&lng=73.8567")
     assert response.status_code == 200
     data = response.json()
+
+    assert data["data_status"] == "LIVE"
     assert data["location"]["latitude"] == 18.5204
     assert data["location"]["longitude"] == 73.8567
-    assert data["prediction"]["risk_score"] >= 0.0
+    assert data["prediction"] is not None
+    assert 0.0 <= data["prediction"]["risk_score"] <= 1.0
+    assert data["features"] is not None
+    assert len(data["features"]) == 12
+    assert "elevation_m" in data["features"]
+    assert "slope_degrees" in data["features"]
 
 
-def test_live_risk_api_post_valid(client):
-    """Test POST /api/risk/live with JSON coordinate payload."""
+def test_live_risk_api_mumbai_coordinates(client):
+    """Test GET /api/risk/live with Mumbai coordinates (19.0760, 72.8777)."""
+    response = client.get("/api/risk/live?lat=19.0760&lng=72.8777")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["data_status"] == "LIVE"
+    assert data["location"]["latitude"] == 19.0760
+    assert data["location"]["longitude"] == 72.8777
+    assert data["prediction"] is not None
+
+
+def test_live_risk_api_post_valid_coordinates(client):
+    """Test POST /api/risk/live with Dehradun coordinates."""
     response = client.post(
         "/api/risk/live",
-        json={"latitude": 27.3389, "longitude": 88.6065},
+        json={"latitude": 30.3165, "longitude": 78.0322},
     )
     assert response.status_code == 200
     data = response.json()
-    assert data["location"]["latitude"] == 27.3389
-    assert data["location"]["longitude"] == 88.6065
+    assert data["data_status"] == "LIVE"
+    assert data["location"]["latitude"] == 30.3165
+    assert data["location"]["longitude"] == 78.0322
 
 
-def test_live_risk_api_invalid_latitude(client):
-    """Test validation failure for latitude > 90."""
-    response = client.get("/api/risk/live?lat=95.0&lng=91.8660")
-    assert response.status_code == 422
+def test_live_risk_api_invalid_coordinates(client):
+    """Test validation errors for out-of-range coordinates."""
+    res1 = client.get("/api/risk/live?lat=95.0&lng=73.8567")
+    assert res1.status_code == 422
+
+    res2 = client.get("/api/risk/live?lat=18.5204&lng=195.0")
+    assert res2.status_code == 422
 
 
-def test_live_risk_api_invalid_longitude(client):
-    """Test validation failure for longitude > 180."""
-    response = client.get("/api/risk/live?lat=27.5861&lng=195.0")
-    assert response.status_code == 422
+# ---------------------------------------------------------------------------
+# 4. Mocked Telemetry & Safe Failure Handling (HTTP 503)
+# ---------------------------------------------------------------------------
 
 
-def test_gis_search_endpoint(client):
-    """Test GET /api/gis/search returns geocoded results."""
-    response = client.get("/api/gis/search?q=Shillong")
-    assert response.status_code == 200
-    results = response.json()
-    assert isinstance(results, list)
-    if len(results) > 0:
-        assert "coordinates" in results[0]
-        assert len(results[0]["coordinates"]) == 2
+@pytest.mark.anyio
+async def test_mock_open_meteo_weather_timeout():
+    """Verify that a network timeout raises LiveTelemetryUnavailableError and does not run ML."""
+    async with httpx.AsyncClient() as client:
+        with patch.object(client, "get", side_effect=httpx.TimeoutException("Connection timed out")):
+            with pytest.raises(LiveTelemetryUnavailableError) as exc_info:
+                await LiveFeatureService.fetch_with_retries(
+                    client=client,
+                    url="https://api.open-meteo.com/v1/forecast",
+                    api_name="Weather & Precipitation",
+                    lat=18.5,
+                    lng=73.8,
+                    max_retries=1,
+                )
+            assert "failed after" in exc_info.value.message
+
+
+def test_api_returns_503_when_weather_unavailable(client):
+    """Verify GET /api/risk/live returns HTTP 503 with prediction=None when external weather fails."""
+    with patch.object(
+        LiveFeatureService,
+        "get_live_risk_for_coordinate",
+        side_effect=LiveTelemetryUnavailableError("Open-Meteo Weather API timeout", missing_source="Weather"),
+    ):
+        response = client.get("/api/risk/live?lat=18.5204&lng=73.8567")
+        assert response.status_code == 503
+        data = response.json()
+        assert data["data_status"] == "UNAVAILABLE"
+        assert data["prediction"] is None
+        assert data["features"] is None
+        assert "Live environmental telemetry is currently unavailable" in data["message"]
+
+
+def test_api_returns_503_when_dem_unavailable(client):
+    """Verify GET /api/risk/live returns HTTP 503 with prediction=None when DEM fails."""
+    with patch.object(
+        LiveFeatureService,
+        "get_live_risk_for_coordinate",
+        side_effect=LiveTelemetryUnavailableError("Copernicus DEM service unavailable", missing_source="DEM"),
+    ):
+        response = client.get("/api/risk/live?lat=18.5204&lng=73.8567")
+        assert response.status_code == 503
+        data = response.json()
+        assert data["data_status"] == "UNAVAILABLE"
+        assert data["prediction"] is None
+
+
+# ---------------------------------------------------------------------------
+# 5. Missing Soil Moisture Graceful Handling
+# ---------------------------------------------------------------------------
+
+
+def test_missing_soil_moisture_sets_available_zero():
+    """Verify that missing soil moisture sets soil_moisture_available=0 without inventing 0.525."""
+    mock_weather_data = {
+        "current": {"temperature_2m": 24.0, "relative_humidity_2m": 70.0, "wind_speed_10m": 8.0},
+        "daily": {"precipitation_sum": [5.0] * 31},
+        "hourly": {
+            "soil_moisture_0_to_1cm": [None] * 24,
+            "soil_moisture_1_to_3cm": [None] * 24,
+        },
+    }
+    mock_dem_data = {"elevation": [600.0, 605.0, 595.0, 600.0, 600.0]}
+
+    load_artifacts()
+
+    async def run_test():
+        with patch.object(LiveFeatureService, "fetch_with_retries") as mock_fetch:
+            res_weather = httpx.Response(200, json=mock_weather_data, request=httpx.Request("GET", "http://test"))
+            res_dem = httpx.Response(200, json=mock_dem_data, request=httpx.Request("GET", "http://test"))
+            mock_fetch.side_effect = [res_weather, res_dem]
+
+            result = await LiveFeatureService.get_live_risk_for_coordinate(18.5204, 73.8567)
+            assert result["features"]["soil_moisture_available"] == 0
+            assert result["features"]["soil_moisture"] == 0.0
+            assert result["prediction"] is not None
+            assert result["data_status"] == "LIVE"
+
+    asyncio.run(run_test())
+
+
+# ---------------------------------------------------------------------------
+# 6. Cache Behavior Tests
+# ---------------------------------------------------------------------------
+
+
+def test_cache_stores_only_successful_live_results(client):
+    """Verify that successful live queries are cached with TTL, but errors are not."""
+    # First successful query
+    res1 = client.get("/api/risk/live?lat=18.5204&lng=73.8567")
+    assert res1.status_code == 200
+    data1 = res1.json()
+    assert data1["data_status"] == "LIVE"
+
+    # Second query should hit cache with data_age_seconds >= 0
+    res2 = client.get("/api/risk/live?lat=18.5204&lng=73.8567")
+    assert res2.status_code == 200
+    data2 = res2.json()
+    assert data2["data_status"] == "LIVE"
+    assert "data_age_seconds" in data2

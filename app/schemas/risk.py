@@ -82,10 +82,11 @@ class LiveRiskRequest(BaseModel):
 
 class LiveRiskResponse(BaseModel):
     location: dict[str, Any]
-    features: dict[str, float | int]
-    prediction: dict[str, Any]
-    environmental: dict[str, Any]
-    data_sources: dict[str, str]
+    features: dict[str, float | int] | None = None
+    prediction: dict[str, Any] | None = None
+    environmental: dict[str, Any] | None = None
+    data_sources: dict[str, str] = Field(default_factory=dict)
     data_timestamp: str
     data_age_seconds: int = 0
-    data_status: str
+    data_status: str  # "LIVE", "STALE", "UNAVAILABLE"
+    message: str | None = None

@@ -11,8 +11,14 @@ from app.schemas.risk import (
     RiskPredictionResponse,
     RiskResult,
 )
-from app.services.live_feature_service import LiveFeatureService
+import logging
+import time
+from fastapi.responses import JSONResponse
+
+from app.services.live_feature_service import LiveFeatureService, LiveTelemetryUnavailableError
 from app.services.risk_service import RiskService
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/api/risk",
@@ -23,6 +29,12 @@ router = APIRouter(
 @router.get(
     "/live",
     response_model=LiveRiskResponse,
+    responses={
+        503: {
+            "model": LiveRiskResponse,
+            "description": "Live environmental telemetry is unavailable from external sources. No ML prediction produced.",
+        }
+    },
     summary="Fetch live telemetry, engineer 12 ML features, and compute real-time landslide risk for any coordinate",
 )
 async def get_live_risk(
@@ -38,13 +50,49 @@ async def get_live_risk(
         return await LiveFeatureService.get_live_risk_for_coordinate(latitude=lat, longitude=lng)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+    except LiveTelemetryUnavailableError as exc:
+        logger.warning("Live telemetry unavailable for (lat=%.4f, lng=%.4f): %s", lat, lng, exc)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "data_status": "UNAVAILABLE",
+                "prediction": None,
+                "message": f"Live environmental telemetry is currently unavailable: {exc.message}",
+                "location": {"latitude": lat, "longitude": lng},
+                "features": None,
+                "environmental": None,
+                "data_sources": {},
+                "data_timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "data_age_seconds": 0,
+            },
+        )
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Live feature extraction error: {exc}")
+        logger.exception("Unexpected error in live risk endpoint for (lat=%.4f, lng=%.4f)", lat, lng)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "data_status": "UNAVAILABLE",
+                "prediction": None,
+                "message": f"Internal live risk computation error: {exc}",
+                "location": {"latitude": lat, "longitude": lng},
+                "features": None,
+                "environmental": None,
+                "data_sources": {},
+                "data_timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "data_age_seconds": 0,
+            },
+        )
 
 
 @router.post(
     "/live",
     response_model=LiveRiskResponse,
+    responses={
+        503: {
+            "model": LiveRiskResponse,
+            "description": "Live environmental telemetry is unavailable from external sources. No ML prediction produced.",
+        }
+    },
     summary="POST coordinate to compute live landslide risk",
 )
 async def post_live_risk(
@@ -58,8 +106,47 @@ async def post_live_risk(
         )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+    except LiveTelemetryUnavailableError as exc:
+        logger.warning(
+            "Live telemetry unavailable for (lat=%.4f, lng=%.4f): %s",
+            payload.latitude,
+            payload.longitude,
+            exc,
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "data_status": "UNAVAILABLE",
+                "prediction": None,
+                "message": f"Live environmental telemetry is currently unavailable: {exc.message}",
+                "location": {"latitude": payload.latitude, "longitude": payload.longitude},
+                "features": None,
+                "environmental": None,
+                "data_sources": {},
+                "data_timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "data_age_seconds": 0,
+            },
+        )
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Live feature extraction error: {exc}")
+        logger.exception(
+            "Unexpected error in live risk endpoint for (lat=%.4f, lng=%.4f)",
+            payload.latitude,
+            payload.longitude,
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "data_status": "UNAVAILABLE",
+                "prediction": None,
+                "message": f"Internal live risk computation error: {exc}",
+                "location": {"latitude": payload.latitude, "longitude": payload.longitude},
+                "features": None,
+                "environmental": None,
+                "data_sources": {},
+                "data_timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "data_age_seconds": 0,
+            },
+        )
 
 
 @router.post(
