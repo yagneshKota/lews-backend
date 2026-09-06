@@ -43,8 +43,8 @@ async def get_live_risk(
 ):
     """
     Centralized live endpoint:
-    Accepts arbitrary latitude & longitude -> fetches real-time Open-Meteo & Copernicus DEM telemetry ->
-    calculates exact 12 ML features -> runs Phase 3 ML model -> returns live risk assessment.
+    Accepts arbitrary latitude & longitude -> fetches real-time NASA POWER & Open Topo Data telemetry ->
+    calculates exact 10 ML features -> runs Phase 3 ML model -> returns live risk assessment.
     """
     try:
         return await LiveFeatureService.get_live_risk_for_coordinate(latitude=lat, longitude=lng)
@@ -52,9 +52,9 @@ async def get_live_risk(
         raise HTTPException(status_code=422, detail=str(exc))
     except LiveTelemetryUnavailableError as exc:
         logger.warning("Live telemetry unavailable for (lat=%.4f, lng=%.4f): %s", lat, lng, exc)
-        rate_limited = bool(getattr(exc, "rate_limited", False) or exc.missing_source == "open-meteo")
+        rate_limited = bool(getattr(exc, "rate_limited", False))
         message = (
-            "Live data provider is temporarily rate-limited. Please try again later."
+            f"Live data provider '{exc.missing_source or 'External API'}' is temporarily rate-limited. Please try again later."
             if rate_limited
             else f"Live environmental telemetry is currently unavailable: {exc.message}"
         )
@@ -123,9 +123,9 @@ async def post_live_risk(
             payload.longitude,
             exc,
         )
-        rate_limited = bool(getattr(exc, "rate_limited", False) or exc.missing_source == "open-meteo")
+        rate_limited = bool(getattr(exc, "rate_limited", False))
         message = (
-            "Live data provider is temporarily rate-limited. Please try again later."
+            f"Live data provider '{exc.missing_source or 'External API'}' is temporarily rate-limited. Please try again later."
             if rate_limited
             else f"Live environmental telemetry is currently unavailable: {exc.message}"
         )

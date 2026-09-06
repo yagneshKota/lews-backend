@@ -1,7 +1,7 @@
 """
 Comprehensive unit and integration tests for the Live Landslide Risk Pipeline.
-Verifies zero hardcoded fallbacks, HTTP 503 safe failures, 12-feature calculations,
-Open-Meteo telemetry integration, and caching mechanics.
+Verifies zero hardcoded fallbacks, HTTP 503 safe failures, 10-feature calculations,
+NASA POWER & Open Topo Data telemetry integration, and caching mechanics.
 """
 
 from __future__ import annotations
@@ -61,7 +61,7 @@ def test_slope_and_aspect_incomplete_raises_error():
     """Verify incomplete or null elevations raise LiveTelemetryUnavailableError without fake defaults."""
     with pytest.raises(LiveTelemetryUnavailableError) as exc_info:
         LiveFeatureService.calculate_slope_and_aspect([500.0, None, 500.0, 500.0, 500.0], 18.5)
-    assert "Copernicus DEM" in exc_info.value.message
+    assert "Open Topo Data" in exc_info.value.message
 
     with pytest.raises(LiveTelemetryUnavailableError):
         LiveFeatureService.calculate_slope_and_aspect([500.0, 500.0], 18.5)
@@ -114,7 +114,7 @@ def test_rainfall_zero_division_safety():
 
 
 def test_rainfall_insufficient_data_raises_error():
-    """Verify series with fewer than 7 days raises LiveTelemetryUnavailableError."""
+    """Verify series with fewer than 30 days raises LiveTelemetryUnavailableError."""
     with pytest.raises(LiveTelemetryUnavailableError):
         LiveFeatureService.extract_rainfall_features([5.0, 2.0, 1.0])
 
@@ -137,10 +137,14 @@ def test_live_risk_api_pune_real_coordinates(client):
     assert 0.0 <= data["prediction"]["risk_score"] <= 1.0
     assert data["features"] is not None
     assert len(data["features"]) == 10
-    
-    # Check that environmental block contains soil moisture
-    assert "soil_moisture" in data["environmental"]
-    assert "soil_moisture_available" in data["environmental"]
+
+    # Check data sources
+    assert data["data_sources"]["rainfall"] == "NASA POWER (PRECTOTCORR)"
+    assert data["data_sources"]["terrain"] == "OpenTopoData SRTM90m"
+
+    # Check environmental block
+    assert data["environmental"]["soil_moisture"] is None
+    assert data["environmental"]["soil_moisture_available"] == 0
     assert "elevation_m" in data["features"]
     assert "slope_degrees" in data["features"]
 
@@ -184,28 +188,29 @@ def test_live_risk_api_invalid_coordinates(client):
 
 
 @pytest.mark.anyio
-async def test_mock_open_meteo_weather_timeout():
+async def test_mock_nasa_power_rainfall_timeout():
     """Verify that a network timeout raises LiveTelemetryUnavailableError and does not run ML."""
     async with httpx.AsyncClient() as client:
         with patch.object(client, "get", side_effect=httpx.TimeoutException("Connection timed out")):
             with pytest.raises(LiveTelemetryUnavailableError) as exc_info:
                 await LiveFeatureService.fetch_with_retries(
                     client=client,
-                    url="https://api.open-meteo.com/v1/forecast",
-                    api_name="Weather & Precipitation",
+                    url="https://power.larc.nasa.gov/api/temporal/daily/point",
+                    api_name="NASA POWER Daily Point API",
                     lat=18.5,
                     lng=73.8,
+                    provider_name="NASA POWER",
                     max_retries=1,
                 )
             assert "failed after" in exc_info.value.message
 
 
-def test_api_returns_503_when_weather_unavailable(client):
-    """Verify GET /api/risk/live returns HTTP 503 with prediction=None when external weather fails."""
+def test_api_returns_503_when_nasa_power_unavailable(client):
+    """Verify GET /api/risk/live returns HTTP 503 with prediction=None when external rainfall fails."""
     with patch.object(
         LiveFeatureService,
         "get_live_risk_for_coordinate",
-        side_effect=LiveTelemetryUnavailableError("Open-Meteo Weather API timeout", missing_source="Weather"),
+        side_effect=LiveTelemetryUnavailableError("NASA POWER Daily API timeout", missing_source="NASA POWER"),
     ):
         response = client.get("/api/risk/live?lat=18.5204&lng=73.8567")
         assert response.status_code == 503
@@ -221,7 +226,7 @@ def test_api_returns_503_when_dem_unavailable(client):
     with patch.object(
         LiveFeatureService,
         "get_live_risk_for_coordinate",
-        side_effect=LiveTelemetryUnavailableError("Copernicus DEM service unavailable", missing_source="DEM"),
+        side_effect=LiveTelemetryUnavailableError("Open Topo Data service unavailable", missing_source="Open Topo Data"),
     ):
         response = client.get("/api/risk/live?lat=18.5204&lng=73.8567")
         assert response.status_code == 503
@@ -236,24 +241,42 @@ def test_api_returns_503_when_dem_unavailable(client):
 
 
 def test_missing_soil_moisture_sets_available_zero():
-    """Verify that missing soil moisture sets soil_moisture_available=0 without inventing 0.525."""
-    mock_weather_data = {
-        "current": {"temperature_2m": 24.0, "relative_humidity_2m": 70.0, "wind_speed_10m": 8.0},
-        "daily": {"precipitation_sum": [5.0] * 31},
-        "hourly": {
-            "soil_moisture_0_to_1cm": [None] * 24,
-            "soil_moisture_1_to_3cm": [None] * 24,
-        },
+    """Verify that soil moisture is always reported as unavailable (soil_moisture_available=0, soil_moisture=None)."""
+    mock_nasa_power_daily = {
+        "properties": {
+            "parameter": {
+                "PRECTOTCORR": {f"202608{i:02d}": 5.0 for i in range(1, 32)}
+            }
+        }
     }
-    mock_dem_data = {"elevation": [600.0, 605.0, 595.0, 600.0, 600.0]}
+    mock_opentopodata_dem = {
+        "results": [
+            {"elevation": 600.0},
+            {"elevation": 605.0},
+            {"elevation": 595.0},
+            {"elevation": 600.0},
+            {"elevation": 600.0},
+        ],
+        "status": "OK",
+    }
+    mock_nasa_hourly = {
+        "properties": {
+            "parameter": {
+                "T2M": {},
+                "RH2M": {},
+                "WS10M": {},
+            }
+        }
+    }
 
     load_artifacts()
 
     async def run_test():
         with patch.object(LiveFeatureService, "fetch_with_retries") as mock_fetch:
-            res_weather = httpx.Response(200, json=mock_weather_data, request=httpx.Request("GET", "http://test"))
-            res_dem = httpx.Response(200, json=mock_dem_data, request=httpx.Request("GET", "http://test"))
-            mock_fetch.side_effect = [res_weather, res_dem]
+            res_rain = httpx.Response(200, json=mock_nasa_power_daily, request=httpx.Request("GET", "http://test"))
+            res_dem = httpx.Response(200, json=mock_opentopodata_dem, request=httpx.Request("GET", "http://test"))
+            res_weather = httpx.Response(200, json=mock_nasa_hourly, request=httpx.Request("GET", "http://test"))
+            mock_fetch.side_effect = [res_rain, res_dem, res_weather]
 
             result = await LiveFeatureService.get_live_risk_for_coordinate(18.5204, 73.8567)
             assert result["environmental"]["soil_moisture_available"] == 0

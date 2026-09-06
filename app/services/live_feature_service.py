@@ -1,18 +1,19 @@
 """
 Centralized live feature engineering and ML risk service.
 
-Cache-first, low-request Open-Meteo usage:
-  - Combined weather + soil + current observations in ONE forecast request
-  - Batched elevation (center + 4 neighbors) in ONE elevation request
-  - Coordinate-normalized TTL caches (weather ~10m, terrain ~24h, prediction ~10m)
+Cache-first, low-request provider usage:
+  - Historical rainfall from NASA POWER Daily Point API (PRECTOTCORR)
+  - 5-point terrain elevation grid from Open Topo Data SRTM90m API (1 request)
+  - Optional current display weather from NASA POWER Hourly API (T2M, RH2M, WS10M)
+  - Coordinate-normalized TTL caches (rainfall ~10m, terrain ~24h, weather ~10m, prediction ~10m)
   - In-flight deduplication for concurrent identical coordinates
-  - HTTP 429: no retries; provider cooldown; stale cache or UNAVAILABLE
-  - 5xx / network: at most one retry
+  - Provider-specific cooldowns and rate-limit handling (NASA POWER, Open Topo Data)
 """
 
 from __future__ import annotations
 
 import asyncio
+import datetime
 import logging
 import math
 import time
@@ -27,12 +28,12 @@ from app.ml.risk_mapping import PredictionResult
 logger = logging.getLogger(__name__)
 
 COORD_DECIMALS = 4
-WEATHER_TTL_SECONDS = 600.0  # 10 minutes
+RAINFALL_TTL_SECONDS = 600.0  # 10 minutes
 ELEVATION_TTL_SECONDS = 86400.0  # 24 hours
+WEATHER_TTL_SECONDS = 600.0  # 10 minutes
 PREDICTION_TTL_SECONDS = 600.0  # 10 minutes
 STALE_MAX_AGE_SECONDS = 86400.0  # stale prediction usable up to 24h
-PROVIDER_COOLDOWN_SECONDS = 60.0
-PROVIDER_NAME = "open-meteo"
+DEFAULT_COOLDOWN_SECONDS = 60.0
 ELEVATION_STEP_DEG = 0.001
 
 HTTP_TIMEOUT = httpx.Timeout(15.0, connect=10.0)
@@ -42,8 +43,9 @@ HTTP_HEADERS = {
 }
 
 # Caches: key -> (stored_at, payload)
-_WEATHER_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
-_ELEVATION_CACHE: dict[str, tuple[float, list[float | None]]] = {}
+_RAINFALL_CACHE: dict[str, tuple[float, list[float]]] = {}
+_ELEVATION_CACHE: dict[str, tuple[float, list[float]]] = {}
+_WEATHER_CACHE: dict[str, tuple[float, dict[str, float | None]]] = {}
 _PREDICTION_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _IN_FLIGHT: dict[str, asyncio.Future] = {}
 _PROVIDER_COOLDOWN: dict[str, float] = {}
@@ -51,8 +53,9 @@ _PROVIDER_COOLDOWN: dict[str, float] = {}
 
 def reset_live_runtime_state() -> None:
     """Test helper: clear caches, in-flight map, and provider cooldown."""
-    _WEATHER_CACHE.clear()
+    _RAINFALL_CACHE.clear()
     _ELEVATION_CACHE.clear()
+    _WEATHER_CACHE.clear()
     _PREDICTION_CACHE.clear()
     _IN_FLIGHT.clear()
     _PROVIDER_COOLDOWN.clear()
@@ -83,25 +86,24 @@ def _cache_get(cache: dict[str, tuple[float, Any]], key: str, ttl: float, now: f
     age = now - stored_at
     if age > STALE_MAX_AGE_SECONDS and ttl < STALE_MAX_AGE_SECONDS:
         return None, age, False
-    # Elevation uses a 24h fresh TTL; keep it even if older than STALE_MAX when ttl is large
     if ttl >= STALE_MAX_AGE_SECONDS and age > ttl:
         return value, age, False
     return value, age, age < ttl
 
 
-def _provider_cooldown_remaining(now: float) -> float:
-    until = _PROVIDER_COOLDOWN.get(PROVIDER_NAME, 0.0)
+def _provider_cooldown_remaining(provider_name: str, now: float) -> float:
+    until = _PROVIDER_COOLDOWN.get(provider_name, 0.0)
     remaining = until - now
     if remaining <= 0:
-        _PROVIDER_COOLDOWN.pop(PROVIDER_NAME, None)
+        _PROVIDER_COOLDOWN.pop(provider_name, None)
         return 0.0
     return remaining
 
 
-def _set_provider_cooldown(seconds: float) -> None:
+def _set_provider_cooldown(provider_name: str, seconds: float) -> None:
     cooldown = max(1.0, min(float(seconds), 300.0))
-    _PROVIDER_COOLDOWN[PROVIDER_NAME] = time.time() + cooldown
-    logger.warning("LIVE_RISK provider=OPEN_METEO status=429 cooldown=%.0fs", cooldown)
+    _PROVIDER_COOLDOWN[provider_name] = time.time() + cooldown
+    logger.warning("LIVE_RISK provider=%s status=429 cooldown=%.0fs", provider_name, cooldown)
 
 
 class LiveFeatureService:
@@ -114,6 +116,7 @@ class LiveFeatureService:
         api_name: str,
         lat: float,
         lng: float,
+        provider_name: str = "NASA POWER",
         max_retries: int = 1,
         stats: dict[str, int] | None = None,
     ) -> httpx.Response:
@@ -123,17 +126,18 @@ class LiveFeatureService:
         429: never retry; apply provider cooldown immediately.
         5xx / network / timeout: at most one retry with exponential backoff.
         """
-        remaining = _provider_cooldown_remaining(time.time())
+        remaining = _provider_cooldown_remaining(provider_name, time.time())
         if remaining > 0:
             logger.warning(
-                "LIVE_RISK provider=OPEN_METEO status=COOLDOWN cooldown=%.0fs lat=%.4f lng=%.4f",
+                "LIVE_RISK provider=%s status=COOLDOWN cooldown=%.0fs lat=%.4f lng=%.4f",
+                provider_name,
                 remaining,
                 lat,
                 lng,
             )
             raise LiveTelemetryUnavailableError(
-                f"Live data provider is temporarily rate-limited. Please try again later. (~{remaining:.0f}s)",
-                missing_source="open-meteo",
+                f"Live data provider '{provider_name}' is temporarily rate-limited. (~{remaining:.0f}s)",
+                missing_source=provider_name,
                 rate_limited=True,
             )
 
@@ -174,18 +178,18 @@ class LiveFeatureService:
                     try:
                         retry_after_s = float(retry_after_header)
                     except (ValueError, TypeError):
-                        retry_after_s = PROVIDER_COOLDOWN_SECONDS
-                    _set_provider_cooldown(retry_after_s if retry_after_s > 0 else PROVIDER_COOLDOWN_SECONDS)
+                        retry_after_s = DEFAULT_COOLDOWN_SECONDS
+                    _set_provider_cooldown(provider_name, retry_after_s if retry_after_s > 0 else DEFAULT_COOLDOWN_SECONDS)
                     raise LiveTelemetryUnavailableError(
-                        "Live data provider is temporarily rate-limited. Please try again later.",
-                        missing_source="open-meteo",
+                        f"Live data provider '{provider_name}' returned HTTP 429.",
+                        missing_source=provider_name,
                         rate_limited=True,
                     )
 
                 if res.status_code >= 500:
                     last_exc = LiveTelemetryUnavailableError(
                         f"{api_name} API returned HTTP {res.status_code}",
-                        missing_source=api_name,
+                        missing_source=provider_name,
                     )
                     logger.warning(
                         "[ERROR] %s transient HTTP %d [attempt %d/%d] (lat=%.4f, lng=%.4f)",
@@ -199,7 +203,7 @@ class LiveFeatureService:
                 else:
                     raise LiveTelemetryUnavailableError(
                         f"{api_name} API returned HTTP {res.status_code}",
-                        missing_source=api_name,
+                        missing_source=provider_name,
                     )
 
             except LiveTelemetryUnavailableError:
@@ -222,7 +226,7 @@ class LiveFeatureService:
 
         raise LiveTelemetryUnavailableError(
             f"{api_name} request failed after {attempts} attempts: {last_exc or 'HTTP error'}",
-            missing_source=api_name,
+            missing_source=provider_name,
         )
 
     @staticmethod
@@ -233,8 +237,8 @@ class LiveFeatureService:
     ) -> tuple[float, float]:
         if len(elevations) < 5 or any(e is None for e in elevations[:5]):
             raise LiveTelemetryUnavailableError(
-                "Copernicus DEM elevation grid has incomplete or null values for 5-point stencil",
-                missing_source="Copernicus DEM",
+                "Open Topo Data SRTM90m elevation grid has incomplete or null values for 5-point stencil",
+                missing_source="Open Topo Data",
             )
 
         zc, zn, zs, ze, zw = [float(e) for e in elevations[:5]]
@@ -265,22 +269,17 @@ class LiveFeatureService:
         if not daily_precip:
             raise LiveTelemetryUnavailableError(
                 "Historical daily precipitation series missing",
-                missing_source="Open-Meteo Precipitation",
+                missing_source="NASA POWER",
             )
 
-        completed = list(daily_precip[:-1] if exclude_current_day and len(daily_precip) > 1 else daily_precip)
-        if any(p is None for p in completed):
-            raise LiveTelemetryUnavailableError(
-                "Historical daily precipitation contains missing days; values were not invented",
-                missing_source="Open-Meteo Precipitation",
-            )
+        completed = [float(p) for p in daily_precip if p is not None and float(p) >= 0.0]
         if len(completed) < 30:
             raise LiveTelemetryUnavailableError(
                 f"Historical daily precipitation series insufficient (got {len(completed)} completed days, need ≥30)",
-                missing_source="Open-Meteo Precipitation",
+                missing_source="NASA POWER",
             )
 
-        past_window = [float(p) for p in completed[-30:]]
+        past_window = completed[-30:]
         rainfall_1d = round(past_window[-1], 1)
         rainfall_3d = round(sum(past_window[-3:]), 1)
         rainfall_7d = round(sum(past_window[-7:]), 1)
@@ -311,11 +310,9 @@ class LiveFeatureService:
         longitude: float,
         features: dict[str, float | int],
         pred: PredictionResult,
-        temperature: float,
-        humidity: float,
-        wind_speed: float,
-        soil_moisture_available: int,
-        soil_moisture_display: float | None,
+        temperature: float | None,
+        humidity: float | None,
+        wind_speed: float | None,
         data_status: str,
         message: str,
         data_age_seconds: int,
@@ -341,16 +338,16 @@ class LiveFeatureService:
                 "rainfall_7d": float(features["rainfall_7d_before"]),
                 "rainfall_14d": float(features["rainfall_14d_before"]),
                 "rainfall_30d": float(features["rainfall_30d_before"]),
-                "soil_moisture": soil_moisture_display,
-                "soil_moisture_available": soil_moisture_available,
+                "soil_moisture": None,
+                "soil_moisture_available": 0,
                 "elevation_m": float(features["elevation_m"]),
                 "slope_degrees": float(features["slope_degrees"]),
                 "aspect_degrees": float(features["aspect_degrees"]),
             },
             "data_sources": {
-                "weather": "Open-Meteo Free API",
-                "terrain": "Open-Meteo Copernicus DEM",
-                "soil_moisture": "Open-Meteo ECMWF IFS" if soil_moisture_available else "Not Available",
+                "rainfall": "NASA POWER (PRECTOTCORR)",
+                "terrain": "OpenTopoData SRTM90m",
+                "soil_moisture": "Not Available",
             },
             "data_timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "data_age_seconds": data_age_seconds,
@@ -363,8 +360,9 @@ class LiveFeatureService:
         cls,
         latitude: float,
         longitude: float,
-        weather: dict[str, Any],
+        rainfall_series: list[float],
         elev_list: list[float | None],
+        weather: dict[str, float | None],
     ) -> dict[str, Any]:
         (
             rainfall_1d,
@@ -374,11 +372,7 @@ class LiveFeatureService:
             rainfall_30d,
             rainfall_7d_max,
             rainfall_ratio,
-        ) = cls.extract_rainfall_features(weather["precip_daily"])
-
-        soil_moisture_available = int(weather["soil_moisture_available"])
-        soil_moisture_model = float(weather["soil_moisture_model"])
-        soil_moisture_display = weather["soil_moisture_display"]
+        ) = cls.extract_rainfall_features(rainfall_series)
 
         elevation_m = round(float(elev_list[0]), 1)  # type: ignore[arg-type]
         slope_deg, aspect_deg = cls.calculate_slope_and_aspect(elev_list, latitude, ELEVATION_STEP_DEG)
@@ -417,75 +411,16 @@ class LiveFeatureService:
             longitude=longitude,
             features=features,
             pred=pred,
-            temperature=float(weather["temperature"]),
-            humidity=float(weather["humidity"]),
-            wind_speed=float(weather["wind_speed"]),
-            soil_moisture_available=soil_moisture_available,
-            soil_moisture_display=soil_moisture_display,
+            temperature=weather.get("temperature"),
+            humidity=weather.get("humidity"),
+            wind_speed=weather.get("wind_speed"),
             data_status="LIVE",
             message="Live environmental telemetry successfully retrieved and analyzed.",
             data_age_seconds=0,
         )
 
     @classmethod
-    def _parse_weather_payload(cls, wdata: Any, latitude: float, longitude: float) -> dict[str, Any]:
-        if not isinstance(wdata, dict):
-            raise LiveTelemetryUnavailableError(
-                "Weather telemetry payload invalid",
-                missing_source="Weather & Precipitation",
-            )
-        current = wdata.get("current")
-        daily = wdata.get("daily")
-        hourly = wdata.get("hourly") or {}
-        if not daily:
-            raise LiveTelemetryUnavailableError(
-                "Weather telemetry payload missing daily precipitation series",
-                missing_source="Weather & Precipitation",
-            )
-        if not current or current.get("temperature_2m") is None:
-            raise LiveTelemetryUnavailableError(
-                "Weather telemetry missing current temperature observation",
-                missing_source="Weather & Precipitation",
-            )
-
-        precip_daily = daily.get("precipitation_sum", [])
-        sm1 = hourly.get("soil_moisture_0_to_1cm", []) if isinstance(hourly, dict) else []
-        valid_sm: float | None = None
-        if isinstance(sm1, list):
-            for val in reversed(sm1):
-                if val is not None:
-                    try:
-                        valid_sm = float(val)
-                        break
-                    except (ValueError, TypeError):
-                        pass
-
-        if valid_sm is not None:
-            soil_moisture_model = round(valid_sm, 3)
-            soil_moisture_available = 1
-            soil_moisture_display: float | None = soil_moisture_model
-        else:
-            soil_moisture_model = 0.0
-            soil_moisture_available = 0
-            soil_moisture_display = None
-            logger.info(
-                "Soil moisture unavailable for (lat=%.4f, lng=%.4f); soil_moisture_available=0",
-                latitude,
-                longitude,
-            )
-
-        return {
-            "temperature": float(current["temperature_2m"]),
-            "humidity": float(current.get("relative_humidity_2m", 0.0)),
-            "wind_speed": float(current.get("wind_speed_10m", 0.0)),
-            "precip_daily": precip_daily,
-            "soil_moisture_model": soil_moisture_model,
-            "soil_moisture_available": soil_moisture_available,
-            "soil_moisture_display": soil_moisture_display,
-        }
-
-    @classmethod
-    async def _fetch_weather(
+    async def _fetch_rainfall(
         cls,
         client: httpx.AsyncClient,
         latitude: float,
@@ -493,35 +428,57 @@ class LiveFeatureService:
         cache_key: str,
         stats: dict[str, int],
         now: float,
-    ) -> dict[str, Any]:
-        cached, age, fresh = _cache_get(_WEATHER_CACHE, cache_key, WEATHER_TTL_SECONDS, now)
+    ) -> list[float]:
+        cached, age, fresh = _cache_get(_RAINFALL_CACHE, cache_key, RAINFALL_TTL_SECONDS, now)
         if fresh and cached is not None:
-            logger.info("LIVE_RISK weather cache=HIT age=%.0fs lat=%.4f lng=%.4f", age, latitude, longitude)
+            logger.info("LIVE_RISK rainfall cache=HIT age=%.0fs lat=%.4f lng=%.4f", age, latitude, longitude)
             return cached
 
-        weather_url = (
-            f"https://api.open-meteo.com/v1/forecast"
-            f"?latitude={latitude}&longitude={longitude}"
-            f"&past_days=30"
-            f"&forecast_days=1"
-            f"&daily=precipitation_sum"
-            f"&hourly=soil_moisture_0_to_1cm"
-            f"&past_hours=3"
-            f"&forecast_hours=1"
-            f"&current=temperature_2m,relative_humidity_2m,wind_speed_10m"
-            f"&timezone=auto"
+        utc_now = datetime.datetime.now(datetime.timezone.utc)
+        end_date = (utc_now - datetime.timedelta(days=1)).strftime("%Y%m%d")
+        start_date = (utc_now - datetime.timedelta(days=45)).strftime("%Y%m%d")
+
+        url = (
+            f"https://power.larc.nasa.gov/api/temporal/daily/point"
+            f"?parameters=PRECTOTCORR&community=AG"
+            f"&longitude={longitude}&latitude={latitude}"
+            f"&start={start_date}&end={end_date}&format=JSON"
         )
-        weather_res = await cls.fetch_with_retries(
+        res = await cls.fetch_with_retries(
             client=client,
-            url=weather_url,
-            api_name="Weather & Precipitation",
+            url=url,
+            api_name="NASA POWER Daily Point API",
             lat=latitude,
             lng=longitude,
+            provider_name="NASA POWER",
             stats=stats,
         )
-        parsed = cls._parse_weather_payload(weather_res.json(), latitude, longitude)
-        _WEATHER_CACHE[cache_key] = (now, parsed)
-        return parsed
+        data = res.json()
+        param_data = (
+            data.get("properties", {}).get("parameter", {}).get("PRECTOTCORR", {})
+            if isinstance(data, dict)
+            else {}
+        )
+        if not param_data:
+            raise LiveTelemetryUnavailableError(
+                "NASA POWER API returned invalid precipitation data",
+                missing_source="NASA POWER",
+            )
+
+        daily_precip: list[float] = []
+        for date_key in sorted(param_data.keys()):
+            val = param_data[date_key]
+            if val is not None and float(val) != -999.0 and float(val) >= 0.0:
+                daily_precip.append(float(val))
+
+        if len(daily_precip) < 30:
+            raise LiveTelemetryUnavailableError(
+                f"NASA POWER API returned insufficient historical rainfall days (got {len(daily_precip)}, need ≥30)",
+                missing_source="NASA POWER",
+            )
+
+        _RAINFALL_CACHE[cache_key] = (now, daily_precip)
+        return daily_precip
 
     @classmethod
     async def _fetch_elevation(
@@ -539,26 +496,95 @@ class LiveFeatureService:
             return cached
 
         step = ELEVATION_STEP_DEG
-        lats = f"{latitude},{latitude + step},{latitude - step},{latitude},{latitude}"
-        lons = f"{longitude},{longitude},{longitude},{longitude + step},{longitude - step}"
-        elev_url = f"https://api.open-meteo.com/v1/elevation?latitude={lats}&longitude={lons}"
+        lats = [latitude, latitude + step, latitude - step, latitude, latitude]
+        lons = [longitude, longitude, longitude, longitude + step, longitude - step]
+        locations = "|".join(f"{la:.6f},{lo:.6f}" for la, lo in zip(lats, lons))
+
+        elev_url = f"https://api.opentopodata.org/v1/srtm90m?locations={locations}"
         elev_res = await cls.fetch_with_retries(
             client=client,
             url=elev_url,
-            api_name="Copernicus DEM",
+            api_name="Open Topo Data SRTM90m",
             lat=latitude,
             lng=longitude,
+            provider_name="Open Topo Data",
             stats=stats,
         )
         edata = elev_res.json()
-        elev_list = edata.get("elevation", [])
-        if not isinstance(elev_list, list) or len(elev_list) < 5 or elev_list[0] is None:
+        results = edata.get("results", []) if isinstance(edata, dict) else []
+        if not isinstance(results, list) or len(results) < 5:
             raise LiveTelemetryUnavailableError(
-                "Copernicus DEM elevation grid returned invalid elevation array",
-                missing_source="Copernicus DEM",
+                "Open Topo Data SRTM90m returned invalid elevation array",
+                missing_source="Open Topo Data",
+            )
+        elev_list = [res_item.get("elevation") for res_item in results[:5]]
+        if any(e is None for e in elev_list):
+            raise LiveTelemetryUnavailableError(
+                "Open Topo Data SRTM90m elevation grid returned null elevation values",
+                missing_source="Open Topo Data",
             )
         _ELEVATION_CACHE[cache_key] = (now, elev_list)
         return elev_list
+
+    @classmethod
+    async def _fetch_weather(
+        cls,
+        client: httpx.AsyncClient,
+        latitude: float,
+        longitude: float,
+        cache_key: str,
+        stats: dict[str, int],
+        now: float,
+    ) -> dict[str, float | None]:
+        cached, age, fresh = _cache_get(_WEATHER_CACHE, cache_key, WEATHER_TTL_SECONDS, now)
+        if fresh and cached is not None:
+            logger.info("LIVE_RISK display weather cache=HIT age=%.0fs lat=%.4f lng=%.4f", age, latitude, longitude)
+            return cached
+
+        try:
+            utc_now = datetime.datetime.now(datetime.timezone.utc)
+            end_date = utc_now.strftime("%Y%m%d")
+            start_date = (utc_now - datetime.timedelta(days=7)).strftime("%Y%m%d")
+            url = (
+                f"https://power.larc.nasa.gov/api/temporal/hourly/point"
+                f"?parameters=T2M,RH2M,WS10M&community=AG"
+                f"&longitude={longitude}&latitude={latitude}"
+                f"&start={start_date}&end={end_date}&format=JSON"
+            )
+            res = await cls.fetch_with_retries(
+                client=client,
+                url=url,
+                api_name="NASA POWER Hourly API",
+                lat=latitude,
+                lng=longitude,
+                provider_name="NASA POWER",
+                max_retries=0,
+                stats=stats,
+            )
+            data = res.json()
+            params = data.get("properties", {}).get("parameter", {}) if isinstance(data, dict) else {}
+
+            def get_latest_valid(param_name: str) -> float | None:
+                p_dict = params.get(param_name, {})
+                if not isinstance(p_dict, dict):
+                    return None
+                for key in sorted(p_dict.keys(), reverse=True):
+                    val = p_dict[key]
+                    if val is not None and float(val) != -999.0:
+                        return round(float(val), 1)
+                return None
+
+            temp = get_latest_valid("T2M")
+            hum = get_latest_valid("RH2M")
+            ws = get_latest_valid("WS10M")
+            parsed = {"temperature": temp, "humidity": hum, "wind_speed": ws}
+            _WEATHER_CACHE[cache_key] = (now, parsed)
+            return parsed
+        except Exception as exc:
+            logger.info("Optional display weather fetch failed for (lat=%.4f, lng=%.4f): %s", latitude, longitude, exc)
+            fallback = {"temperature": None, "humidity": None, "wind_speed": None}
+            _WEATHER_CACHE[cache_key] = (now, fallback)
+            return fallback
 
     @classmethod
     def _stale_prediction(cls, cache_key: str, now: float) -> dict[str, Any] | None:
@@ -582,41 +608,42 @@ class LiveFeatureService:
         request_time: float,
         stats: dict[str, int],
     ) -> dict[str, Any]:
-        cooldown = _provider_cooldown_remaining(request_time)
-        if cooldown > 0:
+        nasa_cooldown = _provider_cooldown_remaining("NASA POWER", request_time)
+        topo_cooldown = _provider_cooldown_remaining("Open Topo Data", request_time)
+        if nasa_cooldown > 0 or topo_cooldown > 0:
             stale = cls._stale_prediction(cache_key, request_time)
             if stale:
                 logger.info(
-                    "LIVE_RISK lat=%.4f lng=%.4f cache=STALE external_calls=%d status=STALE cooldown=%.0fs",
+                    "LIVE_RISK lat=%.4f lng=%.4f cache=STALE status=STALE cooldown active",
                     latitude,
                     longitude,
-                    stats.get("external_calls", 0),
-                    cooldown,
                 )
                 return stale
+            provider_name = "NASA POWER" if nasa_cooldown > 0 else "Open Topo Data"
+            cooldown_val = max(nasa_cooldown, topo_cooldown)
             raise LiveTelemetryUnavailableError(
-                "Live data provider is temporarily rate-limited. Please try again later.",
-                missing_source="open-meteo",
+                f"Live data provider '{provider_name}' is temporarily rate-limited. (~{cooldown_val:.0f}s)",
+                missing_source=provider_name,
                 rate_limited=True,
             )
 
         try:
             async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=HTTP_HEADERS) as client:
-                weather = await cls._fetch_weather(client, latitude, longitude, cache_key, stats, request_time)
+                rainfall_series = await cls._fetch_rainfall(client, latitude, longitude, cache_key, stats, request_time)
                 elev_list = await cls._fetch_elevation(client, latitude, longitude, cache_key, stats, request_time)
+                weather = await cls._fetch_weather(client, latitude, longitude, cache_key, stats, request_time)
         except LiveTelemetryUnavailableError:
             stale = cls._stale_prediction(cache_key, request_time)
             if stale:
                 logger.info(
-                    "LIVE_RISK lat=%.4f lng=%.4f cache=STALE external_calls=%d status=STALE (provider error)",
+                    "LIVE_RISK lat=%.4f lng=%.4f cache=STALE status=STALE (provider error)",
                     latitude,
                     longitude,
-                    stats.get("external_calls", 0),
                 )
                 return stale
             raise
 
-        payload = cls._features_and_prediction_from_telemetry(latitude, longitude, weather, elev_list)
+        payload = cls._features_and_prediction_from_telemetry(latitude, longitude, rainfall_series, elev_list, weather)
         _PREDICTION_CACHE[cache_key] = (request_time, payload)
         logger.info(
             "LIVE_RISK lat=%.4f lng=%.4f cache=MISS external_calls=%d status=LIVE",

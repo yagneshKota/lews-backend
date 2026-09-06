@@ -50,9 +50,12 @@ app.mount(
     name="uploads",
 )
 
+origins = [origin for origin in settings.cors_origin_list if origin != "*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origin_list,
+    allow_origins=origins,
+    allow_origin_regex=r"https?://.*",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

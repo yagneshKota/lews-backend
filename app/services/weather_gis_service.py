@@ -22,11 +22,11 @@ class WeatherGisService:
         if status == "UNAVAILABLE" or not env or not feat:
             raise LiveTelemetryUnavailableError(
                 result.get("message") or "Live environmental telemetry unavailable",
-                missing_source="open-meteo",
+                missing_source="NASA POWER",
             )
 
         return {
-            "source": result.get("data_sources", {}).get("weather", "Open-Meteo Free API & Open GIS"),
+            "source": result.get("data_sources", {}).get("rainfall", "NASA POWER & Open Topo Data"),
             "latitude": latitude,
             "longitude": longitude,
             "rainfall_24h": env.get("rainfall_24h"),
