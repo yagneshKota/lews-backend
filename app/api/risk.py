@@ -52,13 +52,22 @@ async def get_live_risk(
         raise HTTPException(status_code=422, detail=str(exc))
     except LiveTelemetryUnavailableError as exc:
         logger.warning("Live telemetry unavailable for (lat=%.4f, lng=%.4f): %s", lat, lng, exc)
+        rate_limited = bool(getattr(exc, "rate_limited", False) or exc.missing_source == "open-meteo")
+        message = (
+            "Live data provider is temporarily rate-limited. Please try again later."
+            if rate_limited
+            else f"Live environmental telemetry is currently unavailable: {exc.message}"
+        )
         return JSONResponse(
             status_code=503,
             content={
                 "data_status": "UNAVAILABLE",
                 "missing_source": exc.missing_source or "external-api",
+                "rate_limited": rate_limited,
                 "prediction": None,
-                "message": f"Live environmental telemetry is currently unavailable: {exc.message}",
+                "risk_score": None,
+                "risk_tier": "UNAVAILABLE",
+                "message": message,
                 "location": {"latitude": lat, "longitude": lng},
                 "features": None,
                 "environmental": None,
@@ -114,13 +123,22 @@ async def post_live_risk(
             payload.longitude,
             exc,
         )
+        rate_limited = bool(getattr(exc, "rate_limited", False) or exc.missing_source == "open-meteo")
+        message = (
+            "Live data provider is temporarily rate-limited. Please try again later."
+            if rate_limited
+            else f"Live environmental telemetry is currently unavailable: {exc.message}"
+        )
         return JSONResponse(
             status_code=503,
             content={
                 "data_status": "UNAVAILABLE",
                 "missing_source": exc.missing_source or "external-api",
+                "rate_limited": rate_limited,
                 "prediction": None,
-                "message": f"Live environmental telemetry is currently unavailable: {exc.message}",
+                "risk_score": None,
+                "risk_tier": "UNAVAILABLE",
+                "message": message,
                 "location": {"latitude": payload.latitude, "longitude": payload.longitude},
                 "features": None,
                 "environmental": None,

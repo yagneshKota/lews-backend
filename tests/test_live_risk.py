@@ -17,16 +17,16 @@ from app.ml.model_loader import load_artifacts
 from app.services.live_feature_service import (
     LiveFeatureService,
     LiveTelemetryUnavailableError,
-    _FEATURE_CACHE,
+    reset_live_runtime_state,
 )
 
 
 @pytest.fixture(autouse=True)
 def clear_feature_cache():
     """Clear in-memory cache before every test."""
-    _FEATURE_CACHE.clear()
+    reset_live_runtime_state()
     yield
-    _FEATURE_CACHE.clear()
+    reset_live_runtime_state()
 
 
 # ---------------------------------------------------------------------------

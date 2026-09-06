@@ -90,3 +90,7 @@ class LiveRiskResponse(BaseModel):
     data_age_seconds: int = 0
     data_status: str  # "LIVE", "STALE", "UNAVAILABLE"
     message: str | None = None
+    missing_source: str | None = None
+    rate_limited: bool = False
+    risk_score: float | None = None
+    risk_tier: str | None = None

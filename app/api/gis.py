@@ -1,12 +1,13 @@
 from typing import Any
 import httpx
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.models.report import Report
 from app.models.risk_prediction import RiskPrediction
+from app.services.live_feature_service import LiveTelemetryUnavailableError
 from app.services.weather_gis_service import WeatherGisService
 
 router = APIRouter(prefix="/api/gis", tags=["gis"])
@@ -18,7 +19,10 @@ async def get_live_telemetry(
     lng: float = Query(..., ge=-180, le=180),
 ):
     """Fetches real-time Open-Meteo precipitation, soil moisture, and GIS elevation for any GPS coordinate."""
-    return await WeatherGisService.get_realtime_telemetry(lat, lng)
+    try:
+        return await WeatherGisService.get_realtime_telemetry(lat, lng)
+    except LiveTelemetryUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=exc.message) from exc
 
 
 @router.get("/search")
@@ -54,7 +58,7 @@ async def search_places(
                             "state": r.get("admin1") or "",
                             "country": r.get("country") or "India",
                             "coordinates": [lat, lon],
-                            "elevation_m": r.get("elevation") or 1000,
+                            "elevation_m": r.get("elevation"),
                         })
 
             # 2. If fewer than 2 results, try OpenStreetMap Nominatim with India prioritization
@@ -79,7 +83,7 @@ async def search_places(
                                 "state": state,
                                 "country": "India",
                                 "coordinates": [lat, lon],
-                                "elevation_m": 1200,
+                                "elevation_m": None,
                             })
     except Exception:
         pass
