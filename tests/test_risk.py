@@ -11,7 +11,7 @@ def test_predict_without_features_422(client):
 
 def test_predict_and_fetch(client):
     created = client.post("/api/reports", json=REPORT_BODY).json()
-    with patch("app.services.report_service.predictor.predict", side_effect=fake_critical_result):
+    with patch("app.services.risk_service.ModelAdapter.predict", side_effect=fake_critical_result):
         predicted = client.post(
             f"/api/risk/predict/{created['id']}",
             json={"features": CRITICAL_FEATURES},
@@ -33,7 +33,7 @@ def test_predict_and_fetch(client):
 
 def test_create_report_with_features_runs_prediction(client):
     payload = {**REPORT_BODY, "features": CRITICAL_FEATURES}
-    with patch("app.services.report_service.predictor.predict", side_effect=fake_critical_result):
+    with patch("app.services.risk_service.ModelAdapter.predict", side_effect=fake_critical_result):
         created = client.post("/api/reports", json=payload)
     assert created.status_code == 201
     assert created.json()["risk_tier"] == "CRITICAL"

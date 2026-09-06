@@ -61,9 +61,9 @@ async def search_places(
                             "elevation_m": r.get("elevation"),
                         })
 
-            # 2. If fewer than 2 results, try OpenStreetMap Nominatim with India prioritization
+            # 2. If fewer than 2 results, try OpenStreetMap Nominatim globally
             if len(results) < 2:
-                nom_url = f"https://nominatim.openstreetmap.org/search?q={query}&countrycodes=in&format=json&limit={limit}"
+                nom_url = f"https://nominatim.openstreetmap.org/search?q={query}&format=json&limit={limit}"
                 nom_res = await client.get(nom_url)
                 if nom_res.status_code == 200:
                     for item in nom_res.json():
@@ -74,14 +74,14 @@ async def search_places(
                             seen_coords.add(coord_key)
                             display_parts = [p.strip() for p in item.get("display_name", "").split(",")]
                             name = display_parts[0] if display_parts else query
-                            state = display_parts[-2] if len(display_parts) >= 2 else "India"
+                            state = display_parts[-2] if len(display_parts) >= 2 else (display_parts[-1] if display_parts else "")
                             district = display_parts[1] if len(display_parts) >= 3 else state
                             results.append({
                                 "id": f"osm-{item.get('osm_id', len(results))}",
                                 "name": name,
                                 "district": district,
                                 "state": state,
-                                "country": "India",
+                                "country": display_parts[-1] if display_parts else "",
                                 "coordinates": [lat, lon],
                                 "elevation_m": None,
                             })
@@ -89,6 +89,44 @@ async def search_places(
         pass
 
     return results[:limit]
+
+
+@router.get("/reverse")
+async def reverse_geocode(
+    lat: float = Query(..., ge=-90, le=90),
+    lng: float = Query(..., ge=-180, le=180),
+) -> dict[str, Any]:
+    """Reverse geocode GPS coordinates to nearest meaningful human-readable place name."""
+    try:
+        async with httpx.AsyncClient(timeout=3.5, headers={"User-Agent": "GeoAlert/1.0"}) as client:
+            nom_url = f"https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lng}&format=json&zoom=14"
+            res = await client.get(nom_url)
+            if res.status_code == 200:
+                data = res.json()
+                address = data.get("address", {})
+                name = (
+                    address.get("city")
+                    or address.get("town")
+                    or address.get("municipality")
+                    or address.get("village")
+                    or address.get("suburb")
+                    or address.get("locality")
+                    or address.get("county")
+                    or address.get("state_district")
+                    or address.get("state")
+                )
+                if name:
+                    return {
+                        "name": str(name),
+                        "displayName": data.get("display_name"),
+                        "address": address,
+                        "latitude": lat,
+                        "longitude": lng,
+                    }
+    except Exception:
+        pass
+
+    return {"name": f"{lat:.4f}, {lng:.4f}", "latitude": lat, "longitude": lng}
 
 
 @router.get("/reports")

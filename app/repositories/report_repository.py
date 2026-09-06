@@ -58,3 +58,26 @@ class ReportRepository:
 
     def count(self) -> int:
         return self.db.scalar(select(func.count()).select_from(Report)) or 0
+
+    def delete(self, report_id: UUID) -> bool:
+        report = self.get(report_id)
+        if not report:
+            return False
+        try:
+            from app.models.risk_prediction import RiskPrediction
+            self.db.execute(
+                select(RiskPrediction).where(RiskPrediction.report_id == report_id)
+            )
+            # Delete predictions associated with this report
+            predictions = self.db.scalars(
+                select(RiskPrediction).where(RiskPrediction.report_id == report_id)
+            ).all()
+            for pred in predictions:
+                self.db.delete(pred)
+
+            self.db.delete(report)
+            self.db.commit()
+            return True
+        except Exception:
+            self.db.rollback()
+            raise

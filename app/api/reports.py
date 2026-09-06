@@ -65,8 +65,15 @@ def get_report(
             status_code=404,
             detail="Report not found",
         )
-
     return report
+
+@router.delete("/{report_id}", status_code=204)
+def delete_report(
+    report_id: UUID,
+    db: Session = Depends(get_db),
+):
+    ReportService(db).delete(report_id)
+    return None
 
 
 @router.post("/{report_id}/image")

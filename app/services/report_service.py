@@ -71,3 +71,12 @@ class ReportService:
             offset=offset,
             limit=limit,
         )
+
+    def delete(self, report_id: UUID) -> bool:
+        success = self.repo.delete(report_id)
+        if not success:
+            raise HTTPException(
+                status_code=404,
+                detail="Report not found",
+            )
+        return True
