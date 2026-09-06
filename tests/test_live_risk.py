@@ -136,7 +136,11 @@ def test_live_risk_api_pune_real_coordinates(client):
     assert data["prediction"] is not None
     assert 0.0 <= data["prediction"]["risk_score"] <= 1.0
     assert data["features"] is not None
-    assert len(data["features"]) == 12
+    assert len(data["features"]) == 10
+    
+    # Check that environmental block contains soil moisture
+    assert "soil_moisture" in data["environmental"]
+    assert "soil_moisture_available" in data["environmental"]
     assert "elevation_m" in data["features"]
     assert "slope_degrees" in data["features"]
 
@@ -252,8 +256,8 @@ def test_missing_soil_moisture_sets_available_zero():
             mock_fetch.side_effect = [res_weather, res_dem]
 
             result = await LiveFeatureService.get_live_risk_for_coordinate(18.5204, 73.8567)
-            assert result["features"]["soil_moisture_available"] == 0
-            assert result["features"]["soil_moisture"] == 0.0
+            assert result["environmental"]["soil_moisture_available"] == 0
+            assert result["environmental"]["soil_moisture"] is None
             assert result["prediction"] is not None
             assert result["data_status"] == "LIVE"
 

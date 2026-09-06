@@ -3,7 +3,7 @@ from uuid import UUID
 from sqlalchemy.orm import Session
 
 from app.models.risk_prediction import RiskPrediction
-from app.ml.predictor import predictor
+from app.ml.model_adapter import ModelAdapter
 from app.repositories.alert_repository import AlertRepository
 from app.repositories.report_repository import ReportRepository
 from app.repositories.risk_repository import RiskRepository
@@ -17,7 +17,7 @@ class RiskService:
     def __init__(self, db: Session):
         self.db = db
 
-        self.model = predictor
+        self.model = ModelAdapter()
         self.report_repo = ReportRepository(db)
         self.risk_repo = RiskRepository(db)
 

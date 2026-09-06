@@ -394,8 +394,6 @@ class LiveFeatureService:
             "rainfall_30d_before": rainfall_30d,
             "rainfall_7d_max1d": rainfall_7d_max,
             "rainfall_3d_over_7d_ratio": rainfall_ratio,
-            "soil_moisture": soil_moisture_model,
-            "soil_moisture_available": soil_moisture_available,
         }
         missing = [name for name in ALL_FEATURES if name not in features]
         if missing:

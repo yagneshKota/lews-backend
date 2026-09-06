@@ -9,9 +9,13 @@ NUMERIC_FEATURES = [
     "rainfall_30d_before",
     "rainfall_7d_max1d",
     "rainfall_3d_over_7d_ratio",
-    "soil_moisture",
 ]
-INDICATOR_FEATURES = ["soil_moisture_available"]
-ALL_FEATURES = NUMERIC_FEATURES + INDICATOR_FEATURES
 
-TIER_ORDER = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+ALL_FEATURES = NUMERIC_FEATURES
+
+TIER_ORDER = {
+    "LOW": 0,
+    "MEDIUM": 1,
+    "HIGH": 2,
+    "CRITICAL": 3,
+}
